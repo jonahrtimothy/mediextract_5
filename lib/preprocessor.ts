@@ -1,12 +1,9 @@
 // lib/preprocessor.ts
-// Layer 1 — Document Format Detector (7-type classification, no Claude)
+// Layer 1 — Document Format Detector (zone-based, 7-type, no Claude)
 // Layer 2 — Quality Assessor
-// Layer 3 — Adaptive Preprocessor
+// Layer 3 — Format-Aware Adaptive Preprocessor
 
 import sharp from 'sharp';
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-// const pdfParse = require('pdf-parse-new');
 
 // ─────────────────────────────────────────────────────────────
 // TYPES
@@ -37,7 +34,9 @@ export type PreprocessStep =
   | 'binarize'
   | 'grayscale'
   | 'normalize'
-  | 'sharpen';
+  | 'sharpen'
+  | 'adaptive_threshold'
+  | 'stroke_enhance';
 
 export interface PreprocessResult {
   buffer: Buffer;
@@ -52,78 +51,120 @@ export interface DocumentDetection {
   confidence: number;
   page_count: number;
   has_images: boolean;
-  format_detail: string; // human readable explanation
+  format_detail: string;
 }
 
 // ─────────────────────────────────────────────────────────────
-// HELPERS — pixel analysis
+// ZONE ANALYSIS — Core of improved Layer 1
+// Divides image into horizontal strips and classifies each
 // ─────────────────────────────────────────────────────────────
 
-interface PixelStats {
-  mean: number;
-  stdDev: number;
-  min: number;
-  max: number;
-  contrastRatio: number;
-  edgeDensity: number;
+type ZoneType = 'printed' | 'handwritten' | 'blank';
+
+interface ZoneResult {
+  zone: number;
+  type: ZoneType;
+  strokeVariance: number;
+  edgeIrregularity: number;
+  density: number;
 }
 
-async function getPixelStats(buffer: Buffer): Promise<PixelStats> {
+async function analyzeZones(buffer: Buffer, numZones = 8): Promise<ZoneResult[]> {
+  const img = sharp(buffer).grayscale().resize({ width: 600 });
+  const meta = await img.metadata();
+  const h = meta.height ?? 800;
+  const w = 600;
+  const zoneHeight = Math.floor(h / numZones);
+
   const { data } = await sharp(buffer)
     .grayscale()
-    .resize({ width: 800, withoutEnlargement: true })
+    .resize({ width: w, height: h, fit: 'fill' })
     .raw()
     .toBuffer({ resolveWithObject: true });
 
   const pixels = Array.from(data);
-  const len = pixels.length;
+  const results: ZoneResult[] = [];
 
-  const mean = pixels.reduce((a, b) => a + b, 0) / len;
-  const variance = pixels.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / len;
-  const stdDev = Math.sqrt(variance);
-  const min = Math.min(...pixels);
-  const max = Math.max(...pixels);
-  const contrastRatio = (max - min) / 255;
+  for (let z = 0; z < numZones; z++) {
+    const rowStart = z * zoneHeight;
+    const rowEnd   = Math.min(rowStart + zoneHeight, h);
 
-  let edgeSum = 0;
-  for (let i = 1; i < len; i++) {
-    edgeSum += Math.abs(pixels[i] - pixels[i - 1]);
-  }
-  const edgeDensity = edgeSum / len;
+    // Extract zone pixels
+    const zonePixels: number[] = [];
+    for (let r = rowStart; r < rowEnd; r++) {
+      for (let c = 0; c < w; c++) {
+        zonePixels.push(pixels[r * w + c] ?? 255);
+      }
+    }
 
-  return { mean, stdDev, min, max, contrastRatio, edgeDensity };
-}
+    const len = zonePixels.length;
+    const mean = zonePixels.reduce((a, b) => a + b, 0) / len;
 
-// Inter-block variance — divides image into grid and measures
-// variance between block means. High = irregular = handwritten.
-// Low = uniform = printed/scanned digital.
-async function getInterBlockVariance(buffer: Buffer, gridSize = 4): Promise<number> {
-  const img = sharp(buffer).grayscale().resize({ width: 400, height: 400, fit: 'fill' });
-  const { data } = await img.raw().toBuffer({ resolveWithObject: true });
-  const pixels = Array.from(data);
-  const blockSize = Math.floor(400 / gridSize);
-  const blockMeans: number[] = [];
+    // Ink density — percentage of dark pixels (ink)
+    const darkPixels = zonePixels.filter(p => p < 128).length;
+    const density = darkPixels / len;
 
-  for (let row = 0; row < gridSize; row++) {
-    for (let col = 0; col < gridSize; col++) {
-      const blockPixels: number[] = [];
-      for (let r = row * blockSize; r < (row + 1) * blockSize; r++) {
-        for (let c = col * blockSize; c < (col + 1) * blockSize; c++) {
-          blockPixels.push(pixels[r * 400 + c] ?? 128);
+    // Blank zone — very few dark pixels
+    if (density < 0.02) {
+      results.push({ zone: z, type: 'blank', strokeVariance: 0, edgeIrregularity: 0, density });
+      continue;
+    }
+
+    // Stroke width variance — measure horizontal run lengths of dark pixels
+    const runLengths: number[] = [];
+    for (let r = rowStart; r < rowEnd; r++) {
+      let runLen = 0;
+      for (let c = 0; c < w; c++) {
+        const px = pixels[r * w + c] ?? 255;
+        if (px < 128) {
+          runLen++;
+        } else if (runLen > 0) {
+          runLengths.push(runLen);
+          runLen = 0;
         }
       }
-      const mean = blockPixels.reduce((a, b) => a + b, 0) / blockPixels.length;
-      blockMeans.push(mean);
+      if (runLen > 0) runLengths.push(runLen);
     }
+
+    let strokeVariance = 0;
+    if (runLengths.length > 3) {
+      const runMean = runLengths.reduce((a, b) => a + b, 0) / runLengths.length;
+      strokeVariance = runLengths.reduce((a, b) => a + Math.pow(b - runMean, 2), 0) / runLengths.length;
+    }
+
+    // Edge irregularity — variance of pixel-to-pixel differences
+    let edgeSum = 0;
+    const edgeDiffs: number[] = [];
+    for (let i = 1; i < zonePixels.length; i++) {
+      const diff = Math.abs(zonePixels[i] - zonePixels[i - 1]);
+      edgeSum += diff;
+      edgeDiffs.push(diff);
+    }
+    const edgeMean = edgeSum / edgeDiffs.length;
+    const edgeIrregularity = edgeDiffs.reduce((a, b) => a + Math.pow(b - edgeMean, 2), 0) / edgeDiffs.length;
+
+    // Classification per zone:
+    // Handwritten: high stroke variance (pen pressure varies) + moderate edge irregularity
+    // Printed: low stroke variance (uniform font) + regular edges
+    const isHandwritten = strokeVariance > 80 && edgeIrregularity > 15;
+
+    results.push({
+      zone: z,
+      type: isHandwritten ? 'handwritten' : 'printed',
+      strokeVariance,
+      edgeIrregularity,
+      density,
+    });
   }
 
-  const overallMean = blockMeans.reduce((a, b) => a + b, 0) / blockMeans.length;
-  const interBlockVar = blockMeans.reduce((a, b) => a + Math.pow(b - overallMean, 2), 0) / blockMeans.length;
-  return interBlockVar;
+  return results;
 }
 
-// Lighting uniformity — checks if image has uneven illumination
-// (top-left vs bottom-right brightness difference > threshold = photographed)
+// ─────────────────────────────────────────────────────────────
+// LIGHTING UNIFORMITY CHECK
+// Uneven illumination across quadrants = photographed
+// ─────────────────────────────────────────────────────────────
+
 async function getLightingUniformity(buffer: Buffer): Promise<number> {
   const size = 100;
   const { data } = await sharp(buffer)
@@ -145,19 +186,22 @@ async function getLightingUniformity(buffer: Buffer): Promise<number> {
     return region.reduce((a, b) => a + b, 0) / region.length;
   };
 
-  const topLeft     = getRegionMean(0, 0);
-  const topRight    = getRegionMean(0, size);
-  const bottomLeft  = getRegionMean(size, 0);
-  const bottomRight = getRegionMean(size, size);
+  const means = [
+    getRegionMean(0, 0),
+    getRegionMean(0, size),
+    getRegionMean(size, 0),
+    getRegionMean(size, size),
+  ];
 
-  const means = [topLeft, topRight, bottomLeft, bottomRight];
   const avg = means.reduce((a, b) => a + b, 0) / 4;
   const maxDiff = Math.max(...means) - Math.min(...means);
-
-  return maxDiff / (avg || 1); // normalized lighting difference ratio
+  return maxDiff / (avg || 1);
 }
 
-// Fax artifact detection — horizontal line density check
+// ─────────────────────────────────────────────────────────────
+// FAX ARTIFACT DETECTION
+// ─────────────────────────────────────────────────────────────
+
 async function hasFaxArtifacts(buffer: Buffer): Promise<boolean> {
   const { data, info } = await sharp(buffer)
     .grayscale()
@@ -170,19 +214,17 @@ async function hasFaxArtifacts(buffer: Buffer): Promise<boolean> {
   const h = info.height;
   let horizontalLineCount = 0;
 
-  // Check for rows that are nearly all dark (fax lines)
   for (let r = 0; r < h; r++) {
     const row = pixels.slice(r * w, (r + 1) * w);
     const darkPixels = row.filter(p => p < 50).length;
     if (darkPixels / w > 0.85) horizontalLineCount++;
   }
 
-  return horizontalLineCount / h > 0.05; // more than 5% of rows are dark lines
+  return horizontalLineCount / h > 0.05;
 }
 
 // ─────────────────────────────────────────────────────────────
 // LAYER 1 — Document Format Detector
-// 7-type classification without Claude
 // ─────────────────────────────────────────────────────────────
 
 export async function detectDocumentFormat(
@@ -190,30 +232,23 @@ export async function detectDocumentFormat(
   mimeType: string
 ): Promise<DocumentDetection> {
 
-  // ── PDFs: check for text layer first ────────────────────
+  // ── PDFs: raw byte analysis for text layer ───────────────
   if (mimeType === 'application/pdf') {
     try {
       const pdfStr = buffer.toString('binary');
 
-      // Count pages via /Type /Page markers in PDF structure
       const pageMatches = pdfStr.match(/\/Type\s*\/Page[^s]/g);
       const pageCount = pageMatches ? pageMatches.length : 1;
-
-      // Detect text layer — PDFs with text contain BT (Begin Text) operators
-      // Detect embedded images
       const hasImages = pdfStr.includes('/Image') || pdfStr.includes('/XObject');
 
-      // Extract readable ASCII text between BT...ET blocks
-      // Real text PDFs have Tj or TJ operators with actual string content
-      // Scanned PDFs may have BT/ET markers but no readable Tj/TJ content
+      // Real text = Tj/TJ operators with readable ASCII content
       const tjMatches = pdfStr.match(/\(([^\)]{3,})\)\s*Tj/g) || [];
       const tjArrayMatches = pdfStr.match(/\[([^\]]{3,})\]\s*TJ/g) || [];
       const totalTextOps = tjMatches.length + tjArrayMatches.length;
 
-      // Extract actual readable characters from Tj operators
       const readableChars = tjMatches
         .join(' ')
-        .replace(/[^\x20-\x7E]/g, '') // keep only printable ASCII
+        .replace(/[^\x20-\x7E]/g, '')
         .length;
 
       const charsPerPage = readableChars / pageCount;
@@ -224,7 +259,7 @@ export async function detectDocumentFormat(
           confidence: 0.93,
           page_count: pageCount,
           has_images: hasImages,
-          format_detail: `Born-digital PDF — ${readableChars} readable chars across ${pageCount} pages (${totalTextOps} text operations)`,
+          format_detail: `Born-digital PDF — ${readableChars} readable chars, ${totalTextOps} text ops across ${pageCount} pages`,
         };
       }
 
@@ -234,17 +269,15 @@ export async function detectDocumentFormat(
           confidence: 0.75,
           page_count: pageCount,
           has_images: hasImages,
-          format_detail: `Mixed PDF — minimal readable text (${readableChars} chars), likely scanned with digital overlay`,
+          format_detail: `Mixed PDF — minimal text layer (${readableChars} chars), likely scanned with digital overlay`,
         };
       }
 
-      // No text layer at all — pure image PDF
-      // Could be scanned_handwritten, scanned_digital, or scanned_mixed
-      // We can't pixel-analyze PDF pages without rendering — default to scanned_mixed
-      // which is the most common healthcare document type
+      // Image-only PDF — can't pixel-analyze without rendering
+      // Default to scanned_mixed (most common in healthcare)
       return {
         doc_format: 'scanned_mixed',
-        confidence: 0.70,
+        confidence: 0.65,
         page_count: pageCount,
         has_images: true,
         format_detail: `Image-only PDF (${pageCount} pages) — no text layer, scanned document`,
@@ -261,82 +294,83 @@ export async function detectDocumentFormat(
     }
   }
 
-  // ── Images: full pixel analysis ──────────────────────────
+  // ── Images: full zone-based analysis ────────────────────
   try {
     const metadata = await sharp(buffer).metadata();
     const isColor = (metadata.channels ?? 1) >= 3;
 
-    const stats = await getPixelStats(buffer);
-    const interBlockVar = await getInterBlockVariance(buffer);
-    const lightingDiff = await getLightingUniformity(buffer);
+    // Fax check first
     const faxArtifacts = await hasFaxArtifacts(buffer);
-
-    // ── Fax detection ──────────────────────────────────────
     if (faxArtifacts) {
       return {
         doc_format: 'faxed',
         confidence: 0.85,
         page_count: 1,
         has_images: true,
-        format_detail: 'Fax artifacts detected — horizontal line density high, likely fax transmission',
+        format_detail: 'Fax artifacts detected — horizontal line density high',
       };
     }
 
-    // ── Photographed detection ─────────────────────────────
-    // Uneven lighting across quadrants = camera photo
+    // Lighting check — photographed
+    const lightingDiff = await getLightingUniformity(buffer);
     if (lightingDiff > 0.25) {
       return {
         doc_format: 'photographed',
         confidence: 0.82,
         page_count: 1,
         has_images: true,
-        format_detail: `Photographed document — uneven lighting detected (${(lightingDiff * 100).toFixed(0)}% brightness variation across quadrants)`,
+        format_detail: `Photographed — uneven lighting (${(lightingDiff * 100).toFixed(0)}% brightness variation)`,
       };
     }
 
-    // ── Handwritten detection ──────────────────────────────
-    // High inter-block variance + high edge irregularity = handwritten
-    if (interBlockVar > 800 && stats.edgeDensity > 8) {
+    // Zone-based stroke analysis
+    const zones = await analyzeZones(buffer);
+    const nonBlankZones = zones.filter(z => z.type !== 'blank');
+
+    if (nonBlankZones.length === 0) {
+      return {
+        doc_format: 'unknown',
+        confidence: 0.40,
+        page_count: 1,
+        has_images: isColor,
+        format_detail: 'Document appears blank or unreadable',
+      };
+    }
+
+    const handwrittenZones = nonBlankZones.filter(z => z.type === 'handwritten').length;
+    const printedZones     = nonBlankZones.filter(z => z.type === 'printed').length;
+    const hwRatio = handwrittenZones / nonBlankZones.length;
+    const prRatio = printedZones / nonBlankZones.length;
+
+    // Mostly handwritten
+    if (hwRatio >= 0.75) {
       return {
         doc_format: 'scanned_handwritten',
+        confidence: 0.82,
+        page_count: 1,
+        has_images: true,
+        format_detail: `Scanned handwritten — ${handwrittenZones}/${nonBlankZones.length} zones show handwriting patterns (${(hwRatio * 100).toFixed(0)}%)`,
+      };
+    }
+
+    // Mostly printed
+    if (prRatio >= 0.80) {
+      return {
+        doc_format: 'scanned_digital',
         confidence: 0.80,
         page_count: 1,
         has_images: true,
-        format_detail: `Scanned handwritten document — irregular stroke patterns detected (block variance: ${interBlockVar.toFixed(0)})`,
+        format_detail: `Scanned digital — ${printedZones}/${nonBlankZones.length} zones show uniform print patterns (${(prRatio * 100).toFixed(0)}%)`,
       };
     }
 
-    // ── Mixed detection ────────────────────────────────────
-    // Medium inter-block variance = printed form + handwritten fill-ins
-    if (interBlockVar > 300 && interBlockVar <= 800) {
-      return {
-        doc_format: 'scanned_mixed',
-        confidence: 0.75,
-        page_count: 1,
-        has_images: true,
-        format_detail: `Scanned mixed document — printed form with handwritten annotations (block variance: ${interBlockVar.toFixed(0)})`,
-      };
-    }
-
-    // ── Scanned digital detection ──────────────────────────
-    // Low inter-block variance = uniform printed content = scanned digital
-    if (interBlockVar <= 300 && stats.stdDev > 20) {
-      return {
-        doc_format: 'scanned_digital',
-        confidence: 0.78,
-        page_count: 1,
-        has_images: true,
-        format_detail: `Scanned digital document — uniform printed content detected (block variance: ${interBlockVar.toFixed(0)})`,
-      };
-    }
-
-    // ── Digital image fallback ─────────────────────────────
+    // Mix of both
     return {
-      doc_format: 'digital',
-      confidence: 0.65,
+      doc_format: 'scanned_mixed',
+      confidence: 0.75,
       page_count: 1,
-      has_images: isColor,
-      format_detail: `Digital image — clean pixel structure, likely screenshot or exported document`,
+      has_images: true,
+      format_detail: `Scanned mixed — ${handwrittenZones} handwritten + ${printedZones} printed zones detected`,
     };
 
   } catch {
@@ -375,7 +409,7 @@ export async function assessQuality(buffer: Buffer): Promise<QualityReport> {
     }
 
     if (estimated_dpi < 150) {
-      issues.push(`Low DPI detected (~${estimated_dpi}) — text may be blurry`);
+      issues.push(`Low DPI (~${estimated_dpi}) — text may be blurry`);
       recommended_steps.push('upscale');
       quality_score -= 0.25;
     } else if (estimated_dpi < 200) {
@@ -400,7 +434,7 @@ export async function assessQuality(buffer: Buffer): Promise<QualityReport> {
     const contrastRatio = (maxPx - minPx) / 255;
 
     if (contrastRatio < 0.3) {
-      issues.push('Low contrast detected — text may be faint');
+      issues.push('Low contrast — text may be faint');
       recommended_steps.push('clahe');
       recommended_steps.push('normalize');
       quality_score -= 0.20;
@@ -429,7 +463,7 @@ export async function assessQuality(buffer: Buffer): Promise<QualityReport> {
     }
 
     if (width < 800 || height < 600) {
-      issues.push(`Image resolution too small (${width}x${height}) — upscaling needed`);
+      issues.push(`Resolution too small (${width}x${height})`);
       if (!recommended_steps.includes('upscale')) recommended_steps.push('upscale');
       quality_score -= 0.15;
     }
@@ -438,12 +472,13 @@ export async function assessQuality(buffer: Buffer): Promise<QualityReport> {
 
     const aspectRatio = width / height;
     if (aspectRatio > 1.6 || aspectRatio < 0.4) {
-      issues.push('Unusual aspect ratio — document may be rotated or skewed');
+      issues.push('Unusual aspect ratio — may be rotated or skewed');
       recommended_steps.push('deskew');
       quality_score -= 0.10;
     }
 
     void info;
+    void stdDev;
 
   } catch {
     issues.push('Could not analyze image quality — using defaults');
@@ -458,42 +493,72 @@ export async function assessQuality(buffer: Buffer): Promise<QualityReport> {
 }
 
 // ─────────────────────────────────────────────────────────────
-// LAYER 3 — Adaptive Preprocessor
+// LAYER 3 — Format-Aware Adaptive Preprocessor
+// Different preprocessing pipelines per document format
 // ─────────────────────────────────────────────────────────────
 
 export async function preprocessImage(
   buffer: Buffer,
   steps: PreprocessStep[],
+  docFormat?: DocFormat,
   targetMime: 'image/png' | 'image/jpeg' = 'image/png'
 ): Promise<PreprocessResult> {
   const steps_applied: PreprocessStep[] = [];
+
+  // Override steps based on doc format for best results
+  let effectiveSteps = [...steps];
+
+  if (docFormat === 'scanned_handwritten') {
+    // Handwriting needs: grayscale + upscale + adaptive threshold + stroke enhance
+    effectiveSteps = ['grayscale', 'upscale', 'normalize', 'sharpen', 'adaptive_threshold'];
+  } else if (docFormat === 'faxed') {
+    // Fax needs: heavy denoise + binarize + upscale
+    effectiveSteps = ['grayscale', 'denoise', 'upscale', 'binarize'];
+  } else if (docFormat === 'photographed') {
+    // Photo needs: CLAHE + normalize + upscale
+    effectiveSteps = ['grayscale', 'clahe', 'normalize', 'upscale', 'sharpen'];
+  } else if (docFormat === 'scanned_mixed') {
+    // Mixed needs: denoise + normalize + mild upscale
+    effectiveSteps = ['grayscale', 'denoise', 'normalize', 'upscale'];
+  } else if (docFormat === 'scanned_digital') {
+    // Scanned digital: normalize + denoise
+    effectiveSteps = ['grayscale', 'normalize', 'denoise'];
+  }
+
   let pipeline = sharp(buffer);
 
-  if (steps.includes('grayscale')) {
+  if (effectiveSteps.includes('grayscale')) {
     pipeline = pipeline.grayscale();
     steps_applied.push('grayscale');
   }
-  if (steps.includes('normalize')) {
+
+  if (effectiveSteps.includes('normalize')) {
     pipeline = pipeline.normalize();
     steps_applied.push('normalize');
   }
-  if (steps.includes('clahe')) {
+
+  if (effectiveSteps.includes('clahe')) {
     pipeline = pipeline.normalise({ lower: 1, upper: 99 }).linear(1.3, -20);
     steps_applied.push('clahe');
   }
-  if (steps.includes('denoise')) {
+
+  if (effectiveSteps.includes('denoise')) {
     pipeline = pipeline.median(3).sharpen({ sigma: 0.5 });
     steps_applied.push('denoise');
   }
-  if (steps.includes('sharpen') && !steps_applied.includes('denoise')) {
-    pipeline = pipeline.sharpen({ sigma: 1.0, m1: 1.5, m2: 0.7 });
+
+  if (effectiveSteps.includes('sharpen') && !steps_applied.includes('denoise')) {
+    pipeline = pipeline.sharpen({ sigma: 1.2, m1: 2.0, m2: 0.5 });
     steps_applied.push('sharpen');
   }
-  if (steps.includes('upscale')) {
+
+  if (effectiveSteps.includes('upscale')) {
     const meta = await sharp(buffer).metadata();
     const w = meta.width ?? 800;
     if (w < 1700) {
-      const scaleFactor = Math.min(3.0, 1700 / w);
+      // For handwriting, scale up more aggressively
+      const targetWidth = docFormat === 'scanned_handwritten' ? 2400 : 1700;
+      const scaleFactor = Math.min(3.0, targetWidth / w);
       pipeline = pipeline.resize({
         width: Math.round(w * scaleFactor),
         kernel: sharp.kernel.lanczos3,
@@ -501,19 +566,31 @@ export async function preprocessImage(
       steps_applied.push('upscale');
     }
   }
-  if (steps.includes('deskew')) {
-    pipeline = pipeline.rotate(0, { background: { r: 255, g: 255, b: 255, alpha: 1 } });
-    steps_applied.push('deskew');
+
+  if (effectiveSteps.includes('adaptive_threshold')) {
+    // Approximate adaptive threshold: normalize + high contrast linear
+    // True adaptive threshold needs OpenCV — this is a good approximation
+    pipeline = pipeline
+      .normalise({ lower: 2, upper: 98 })
+      .linear(1.8, -40)
+      .threshold(160);
+    steps_applied.push('adaptive_threshold');
   }
-  if (steps.includes('binarize')) {
-    pipeline = pipeline.grayscale().threshold(128);
-    if (!steps_applied.includes('grayscale')) steps_applied.push('grayscale');
+
+  if (effectiveSteps.includes('binarize') && !steps_applied.includes('adaptive_threshold')) {
+    pipeline = pipeline.threshold(128);
     steps_applied.push('binarize');
   }
 
+  if (effectiveSteps.includes('deskew')) {
+    pipeline = pipeline.rotate(0, { background: { r: 255, g: 255, b: 255, alpha: 1 } });
+    steps_applied.push('deskew');
+  }
+
+  // Cap at 2400px for Claude Vision
   const preFinalMeta = await pipeline.clone().metadata();
-  if ((preFinalMeta.width ?? 0) > 2000) {
-    pipeline = pipeline.resize({ width: 2000, withoutEnlargement: false });
+  if ((preFinalMeta.width ?? 0) > 2400) {
+    pipeline = pipeline.resize({ width: 2400, withoutEnlargement: false });
   }
 
   let outBuffer: Buffer;
@@ -539,7 +616,8 @@ export async function preprocessImage(
 
 export async function runPreprocessPipeline(
   buffer: Buffer,
-  mimeType: string
+  mimeType: string,
+  docFormat?: DocFormat
 ): Promise<{ result: PreprocessResult; report: QualityReport }> {
 
   if (mimeType === 'application/pdf') {
@@ -562,6 +640,6 @@ export async function runPreprocessPipeline(
   }
 
   const report = await assessQuality(buffer);
-  const result = await preprocessImage(buffer, report.recommended_steps);
+  const result = await preprocessImage(buffer, report.recommended_steps, docFormat);
   return { result, report };
 }

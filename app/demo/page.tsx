@@ -21,6 +21,9 @@ interface PipelineResult {
     processing_time_ms: number;
     quality_issues: string[];
     token_usage?: TokenUsage;
+    warnings?: string[];
+    review_status?: 'AUTO_APPROVED' | 'NEEDS_REVIEW' | 'MANUAL_REVIEW';
+    review_fields?: string[];
   };
   fields: Record<string, ValidatedField>;
   flags: string[];
@@ -220,6 +223,31 @@ export default function DemoPage() {
                     <span className="text-red-400">✕ {result.pipeline.failed_count} failed</span>
                     <span className="text-yellow-400">⚠ {result.pipeline.warning_count} warnings</span>
                   </div>
+
+                  {/* Review status badge */}
+                  {result.pipeline.review_status && (
+                    <div className={`mt-3 inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold ${
+                      result.pipeline.review_status === 'AUTO_APPROVED'
+                        ? 'bg-green-900 border border-green-700 text-green-300'
+                        : result.pipeline.review_status === 'NEEDS_REVIEW'
+                        ? 'bg-yellow-900 border border-yellow-700 text-yellow-300'
+                        : 'bg-red-900 border border-red-700 text-red-300'
+                    }`}>
+                      {result.pipeline.review_status === 'AUTO_APPROVED' && '✅ AUTO APPROVED'}
+                      {result.pipeline.review_status === 'NEEDS_REVIEW' && '⚠️ NEEDS REVIEW'}
+                      {result.pipeline.review_status === 'MANUAL_REVIEW' && '🔴 MANUAL REVIEW REQUIRED'}
+                    </div>
+                  )}
+
+                  {/* Fields needing review */}
+                  {result.pipeline.review_fields &&
+                   result.pipeline.review_fields.length > 0 &&
+                   result.pipeline.review_status !== 'AUTO_APPROVED' && (
+                    <div className="mt-2 text-xs text-gray-500">
+                      Fields needing review: {result.pipeline.review_fields.slice(0, 8).join(', ')}
+                      {result.pipeline.review_fields.length > 8 && ` +${result.pipeline.review_fields.length - 8} more`}
+                    </div>
+                  )}
                 </div>
 
                 {/* Flags */}

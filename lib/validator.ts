@@ -10,6 +10,8 @@ export interface ValidatedField {
   reason?: string;
 }
 
+export type ReviewStatus = 'AUTO_APPROVED' | 'NEEDS_REVIEW' | 'MANUAL_REVIEW';
+
 export interface ValidationResult {
   fields: Record<string, ValidatedField>;
   flags: string[];
@@ -17,6 +19,8 @@ export interface ValidationResult {
   validated_count: number;
   failed_count: number;
   warning_count: number;
+  review_status: ReviewStatus;
+  review_fields: string[];
 }
 
 export type RawFields = Record<string, string | string[] | number | null | undefined>;
@@ -481,5 +485,25 @@ export function validateFields(rawFields: RawFields): ValidationResult {
   const warning_count   = Object.values(fields).filter(f => f.valid && f.confidence !== 'high').length;
   const overall_confidence = computeOverallConfidence(fields);
 
-  return { fields, flags, overall_confidence, validated_count, failed_count, warning_count };
+  // ── Review status thresholds (Strategy 5) ───────────────
+  const review_status: ReviewStatus =
+    overall_confidence >= 0.85 ? 'AUTO_APPROVED' :
+    overall_confidence >= 0.60 ? 'NEEDS_REVIEW' :
+    'MANUAL_REVIEW';
+
+  // Fields that need human review — medium confidence or failed
+  const review_fields = Object.entries(fields)
+    .filter(([, f]) => !f.valid || f.confidence !== 'high')
+    .map(([k]) => k);
+
+  return {
+    fields,
+    flags,
+    overall_confidence,
+    validated_count,
+    failed_count,
+    warning_count,
+    review_status,
+    review_fields,
+  };
 }

@@ -27,6 +27,7 @@ export type DocType =
   | 'prior_auth_request'
   | 'prior_auth_response'
   | 'operative_report'
+  | 'handwritten_note'
   | 'unknown';
 
 export interface DetectionResult {
@@ -80,6 +81,7 @@ Document types to choose from:
 - prior_auth_response: Prior authorization approval or denial response
 - operative_report: Surgical or operative report
 - unknown: Cannot determine document type
+- handwritten_note: Handwritten patient note, intake form, or demographic sheet with basic patient info
 
 Respond with exactly this JSON structure:
 {
@@ -640,6 +642,31 @@ Respond ONLY with a JSON object — no markdown, no explanation.
   }
 }`,
 
+  handwritten_note: `You are an expert at reading handwritten healthcare documents.
+This is a handwritten patient note or intake form. Extract whatever patient information is present.
+Respond ONLY with a JSON object — no markdown, no explanation.
+
+{
+  "patient_name": "full name — correct obvious misspellings using common name patterns",
+  "date_of_birth": "MM/DD/YYYY or null",
+  "age": "age or null",
+  "gender": "Male or Female or null",
+  "phone": "phone number or null",
+  "mobile": "mobile number or null",
+  "address": "address or null",
+  "email": "email or null",
+  "date": "any date found or null",
+  "insurance": "insurance info or null",
+  "guarantor": "guarantor name or null",
+  "physician": "physician name or null",
+  "diagnosis": "diagnosis or null",
+  "medications": "medications or null",
+  "allergies": "allergies or NKDA or null",
+  "billing_note": "any billing instructions or null",
+  "additional_notes": "any other important information found",
+  "raw_content": "transcribe all readable text exactly as written"
+}`,
+
   unknown: `You are a healthcare document specialist. This document could not be auto-classified.
 Extract whatever structured information you can find. Respond ONLY with a JSON object — no markdown.
 
@@ -655,6 +682,127 @@ Extract whatever structured information you can find. Respond ONLY with a JSON o
   "key_fields": {"field_name": "value for any other important fields found"}
 }`,
 };
+
+// ─────────────────────────────────────────────────────────────
+// HANDWRITING CONTEXT — Strategy 1 + 4
+// Appended to extraction prompts when doc is handwritten/mixed
+// Based on real healthcare handwriting patterns and abbreviations
+// ─────────────────────────────────────────────────────────────
+
+const HANDWRITING_CONTEXT = `
+
+IMPORTANT — THIS DOCUMENT CONTAINS HANDWRITTEN CONTENT:
+
+Common healthcare handwriting abbreviations you will encounter:
+PATIENT:     pt / pt. / Pt / PT = patient
+NAME:        nm / name / pt name / pt. name
+DATE:        dt / dte / date
+DATE OF BIRTH: DOB / dob / D.O.B / Bd / BD / bday / birthdate
+AGE:         age / Age / yrs / y/o / yo
+GENDER:      m / M = Male, f / F = Female, mx / Mx = Non-binary
+ADDRESS:     addr / add / Addr / address
+PHONE:       ph / Ph / PH / tel / Tel / phone / mob / cell
+MOBILE:      mob / Mob / cell / Cell / mobile
+WORK PHONE:  wk / Wk / work / wrk
+EMAIL:       em / email / e-mail / Email
+INSURANCE:   ins / Ins / INS / insur
+GUARANTOR:   guar / Guar / grtr / guarantor
+EMERGENCY:   emer / emerg / EC = emergency contact
+SIGNATURE:   sig / sgn / sign
+DATE SIGNED: signed / dt signed / sign date
+PHYSICIAN:   dr / Dr / DR / phys / MD / physician
+DIAGNOSIS:   dx / Dx / DX = diagnosis
+PROCEDURE:   px / Px / proc = procedure
+ALLERGIES:   allg / allergy / NKA / NKDA = no known allergies
+MEDICATIONS: meds / Meds / rx / Rx
+BLOOD TYPE:  BT / bl type / blood type
+WEIGHT:      wt / Wt / WT
+HEIGHT:      ht / Ht / HT
+PRIOR AUTH:  PA / P/A / prior auth / auth
+SOCIAL SECURITY: SSN / SS# / S.S. / soc sec
+
+CHARACTER AMBIGUITY — use context to resolve:
+- '1' vs 'l' vs 'I' → use context (date=1, name=l or I)
+- '0' vs 'O' → use context (number field=0, text=O)
+- '5' vs 'S' → use context (phone/number=5, text=S)
+- '6' vs 'b' → use context
+- '9' vs 'g' → use context
+- 'n' vs 'u' → use context (name field, use common names)
+- 'e' vs 'c' vs 'o' → use context
+- 'rn' vs 'm' → use context (first/last name patterns)
+- 'vv' vs 'w' → almost always 'w' in names
+
+DATE FORMATS commonly seen in handwriting:
+- MM/DD/YY or MM/DD/YYYY
+- DD/MM/YY (less common, use context)
+- Month DD YYYY (e.g. Jan 5 1990)
+- 2-digit years: 00-29 = 2000-2029, 30-99 = 1930-1999
+
+FEW-SHOT EXAMPLES — real handwriting patterns:
+Example 1:
+  Handwritten: "pt. name: Jhn Doe" → patient_name = "John Doe"
+  Handwritten: "DOB: 3/15/85" → date_of_birth = "03/15/1985"
+  Handwritten: "m" (alone on gender line) → gender = "Male"
+  Handwritten: "Ph: 9876543210" → phone = "9876543210"
+  Handwritten: "addr: 123 Mn St, LA" → address = "123 Main St, Los Angeles"
+
+Example 2:
+  Handwritten: "pt nm: Mary Smth" → patient_name = "Mary Smith"
+  Handwritten: "age: 34 f" → age = "34", gender = "Female"
+  Handwritten: "ins: BCBS grp 4521" → insurance_name = "Blue Cross Blue Shield", group_number = "4521"
+  Handwritten: "guar: Robt Smth (husb)" → guarantor_name = "Robert Smith", relationship = "Husband"
+  Handwritten: "NKA" → allergies = "No Known Allergies"
+
+Example 3 (anesthesia context):
+  Handwritten: "pt: Sarah Jnsn DOB 11/2/78 F" → name="Sarah Johnson", dob="11/02/1978", gender="Female"
+  Handwritten: "ins: UHC mbr# 12345678" → insurance_name="UnitedHealthcare", member_id="12345678"
+  Handwritten: "PA# 987654" → prior_auth_number = "987654"
+  Handwritten: "guar: Tm Jnsn - Father" → guarantor_name="Tom Johnson", relationship="Father"
+  Handwritten: "billing note: chrg only meds" → billing_note = "charge only medicine"
+
+STICKER DETECTION:
+Some pages may have a printed digital sticker pasted over handwritten content.
+The sticker will have clean printed text with patient name, DOB, MRN, and sometimes insurance.
+Extract from the sticker — it is more reliable than surrounding handwriting.
+Stickers often appear in the top corner or center of the page.
+
+INSTRUCTIONS:
+- Make your best attempt at every field even if handwriting is unclear
+- Use surrounding context to resolve ambiguous characters
+- If a field is genuinely unreadable, mark it as null
+- Do NOT leave fields empty just because handwriting is unclear — guess intelligently
+- Correct obvious misspellings in names using common name patterns
+`;
+
+// ─────────────────────────────────────────────────────────────
+// FORMAT-AWARE PROMPT BUILDER
+// Combines doc type specialist prompt + format context
+// ─────────────────────────────────────────────────────────────
+
+type DocFormatType =
+  | 'digital'
+  | 'scanned_digital'
+  | 'scanned_handwritten'
+  | 'scanned_mixed'
+  | 'photographed'
+  | 'faxed'
+  | 'unknown'
+  | 'handwritten_note';
+
+function buildExtractionPrompt(docType: DocType, docFormat?: DocFormatType): string {
+  const basePrompt = EXTRACTION_PROMPTS[docType] ?? EXTRACTION_PROMPTS['unknown'];
+
+  // Append handwriting context for handwritten or mixed docs
+  if (
+    docFormat === 'scanned_handwritten' ||
+    docFormat === 'scanned_mixed' ||
+    docFormat === 'photographed'
+  ) {
+    return basePrompt + HANDWRITING_CONTEXT;
+  }
+
+  return basePrompt;
+}
 
 // ─────────────────────────────────────────────────────────────
 // BUILD MESSAGE CONTENT
@@ -744,9 +892,10 @@ export async function detectDocumentType(
 export async function extractFields(
   buffer: Buffer,
   mimeType: string,
-  docType: DocType
+  docType: DocType,
+  docFormat?: DocFormatType
 ): Promise<{ fields: Record<string, string | string[] | number | null>; token_usage: TokenUsage }> {
-  const prompt = EXTRACTION_PROMPTS[docType] ?? EXTRACTION_PROMPTS['unknown'];
+  const prompt = buildExtractionPrompt(docType, docFormat);
   const content = buildContent(buffer, mimeType, prompt);
 
   const response = await client.messages.create({
@@ -779,14 +928,14 @@ export async function extractFields(
 
 export async function runClaudePipeline(
   buffer: Buffer,
-  mimeType: string
+  mimeType: string,
+  docFormat?: DocFormatType
 ): Promise<ExtractionResult> {
   // Step 1: Detect
   const detection = await detectDocumentType(buffer, mimeType);
 
-  // Step 2: Extract
-  // Step 2: Extract
-  const { fields, token_usage: extractionTokens } = await extractFields(buffer, mimeType, detection.doc_type);
+  // Step 2: Extract with format-aware prompt
+  const { fields, token_usage: extractionTokens } = await extractFields(buffer, mimeType, detection.doc_type, docFormat);
 
   // Combined token usage across both calls
   const token_usage: TokenUsage = {

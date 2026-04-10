@@ -27,6 +27,7 @@ const DOC_TYPES = [
   'Prior Auth', 'Denial Letter', 'Insurance Card',
   'Clinical Note', 'Discharge Summary', 'Anesthesia Record',
   'Anesthesia Demographics', 'Operative Report', 'Referral Letter',
+  'Handwritten Note',
 ];
 
 export default function UploadZone({ onFileSelected, disabled }: UploadZoneProps) {
