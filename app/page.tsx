@@ -45,7 +45,7 @@ export default function LandingPage() {
       {/* Feature pills */}
       <div className="flex flex-wrap gap-2 justify-center mb-10">
         {[
-          '14 RCM Document Types',
+          '16 RCM Document Types',
           'CMS-1500 · UB-04 · EOB',
           'Prior Auth · Denial Letters',
           'ICD-10 · CPT · HCPCS Validation',
