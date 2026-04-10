@@ -26,7 +26,7 @@ const DOC_TYPES = [
   'CMS-1500', 'UB-04', 'EOB', 'ERA',
   'Prior Auth', 'Denial Letter', 'Insurance Card',
   'Clinical Note', 'Discharge Summary', 'Anesthesia Record',
-  'Operative Report', 'Referral Letter',
+  'Anesthesia Demographics', 'Operative Report', 'Referral Letter',
 ];
 
 export default function UploadZone({ onFileSelected, disabled }: UploadZoneProps) {

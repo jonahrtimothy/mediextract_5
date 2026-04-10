@@ -70,6 +70,13 @@ export default function PipelineSteps({ steps }: PipelineStepsProps) {
 // HELPER — build steps array from pipeline response
 // ─────────────────────────────────────────────────────────────
 
+export interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  estimated_cost_usd: number;
+}
+
 export interface PipelineData {
   doc_format?: string;
   quality_score?: number;
@@ -81,6 +88,7 @@ export interface PipelineData {
   failed_count?: number;
   warning_count?: number;
   overall_confidence?: number;
+  token_usage?: TokenUsage;
 }
 
 export function buildSteps(pipeline: PipelineData, state: 'processing' | 'done' | 'error'): Step[] {

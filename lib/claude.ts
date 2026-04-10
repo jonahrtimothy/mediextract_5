@@ -23,6 +23,7 @@ export type DocType =
   | 'clinical_note'
   | 'discharge_summary'
   | 'anesthesia_record'
+  | 'anesthesia_demographics'
   | 'prior_auth_request'
   | 'prior_auth_response'
   | 'operative_report'
@@ -32,6 +33,14 @@ export interface DetectionResult {
   doc_type: DocType;
   confidence: number;
   reason: string;
+  token_usage: TokenUsage;
+}
+
+export interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  estimated_cost_usd: number;
 }
 
 export interface ExtractionResult {
@@ -39,6 +48,7 @@ export interface ExtractionResult {
   detection_confidence: number;
   fields: Record<string, string | string[] | number | null>;
   raw_text: string;
+  token_usage: TokenUsage;
 }
 
 type MessageContent =
@@ -480,6 +490,156 @@ Respond ONLY with a JSON object — no markdown, no explanation.
   "disposition": "patient disposition post-op"
 }`,
 
+  anesthesia_demographics: `You are an expert healthcare registration specialist extracting data from an anesthesia department patient demographics document. This may be a multi-page PDF.
+
+IMPORTANT INSTRUCTIONS:
+1. Extract all 5 sections below. If a section is not present in the document, return null for that section.
+2. PAGE IDENTITY CHECK: Read every page. Extract patient name and DOB from each page. If any page has a different patient name or DOB than page 1, flag it as a mismatch with the page number.
+3. STICKER DETECTION: Some handwritten pages may have a printed digital sticker pasted on them. If the surrounding page is handwritten or unreadable, extract patient details from the sticker.
+4. BILLING NOTE: If there is any note about billing instructions (e.g. "consultation fees waived", "charge only medicine", "do not charge", "partial payment only"), extract it as raw text.
+5. MINOR CHECK: If patient age is under 18 or DOB indicates the patient is under 18, set is_minor to true.
+6. INSURANCE TIERS: Only extract insurance tiers (primary, secondary, tertiary) that are actually present in the document.
+
+Respond ONLY with a JSON object — no markdown, no explanation.
+
+{
+  "page_count": "total number of pages in document",
+  "identity_check": {
+    "anchor_name": "patient name from page 1",
+    "anchor_dob": "DOB from page 1",
+    "mismatched_pages": [
+      { "page": 2, "name_found": "different name", "dob_found": "different DOB" }
+    ]
+  },
+
+  "section1_patient": {
+    "first_name": "first name or null",
+    "last_name": "last name or null",
+    "middle_name": "middle name or null",
+    "suffix": "suffix or null",
+    "age": "age or null",
+    "gender": "gender or null",
+    "date_of_birth": "MM/DD/YYYY or null",
+    "is_minor": "true or false",
+    "street_address": "street address or null",
+    "city": "city or null",
+    "state": "state or null",
+    "zip_code": "zip or null",
+    "country": "country or null",
+    "has_usa_address": "true or false or null",
+    "medical_record_number": "MRN or null",
+    "billing_status": "billing status or null",
+    "marital_status": "marital status or null",
+    "social_security_number": "SSN or null",
+    "home_number": "home phone or null",
+    "mobile_number": "mobile phone or null",
+    "work_number": "work phone or null",
+    "email_address": "email or null",
+    "billing_note": "raw billing instruction text or null",
+    "multiple_patients": "true or false or null"
+  },
+
+  "section2_accident": {
+    "present": "true or false",
+    "accident_type": "accident type or null",
+    "date_of_accident": "MM/DD/YYYY or null"
+  },
+
+  "section3_guarantor": {
+    "present": "true or false",
+    "full_name": "guarantor full name or null",
+    "email_address": "email or null",
+    "city": "city or null",
+    "work_number": "work phone or null",
+    "home_number": "home phone or null",
+    "mobile_number": "mobile phone or null",
+    "zip_code": "zip or null",
+    "street_address": "street address or null",
+    "gender": "gender or null",
+    "relationship": "relationship to patient or null",
+    "country": "country or null",
+    "has_usa_address": "true or false or null"
+  },
+
+  "section4_insurance": {
+    "primary": {
+      "present": "true or false",
+      "insurance_coverage": "coverage type or null",
+      "insurance_type": "type or null",
+      "insurance_name": "payer name or null",
+      "insurance_contract_number": "contract number or null",
+      "insurance_group_number": "group number or null",
+      "subscriber_name": "subscriber name or null",
+      "subscriber_dob": "MM/DD/YYYY or null",
+      "subscriber_gender": "gender or null",
+      "subscriber_relationship": "relationship or null",
+      "insurance_address": "address or null",
+      "adjustor_fax": "fax or null",
+      "adjustor_phone": "phone or null",
+      "adjustor_name": "name or null",
+      "prior_auth_number": "auth number or null",
+      "card_insurance_group": "group from card or null",
+      "card_insurance_code": "code from card or null",
+      "card_id_insurance_name": "ID name from card or null",
+      "card_insured_member_id": "member ID from card or null",
+      "card_insurance_address": "address from card or null",
+      "card_insured_name": "insured name from card or null"
+    },
+    "secondary": {
+      "present": "true or false",
+      "insurance_coverage": "coverage type or null",
+      "insurance_type": "type or null",
+      "insurance_name": "payer name or null",
+      "insurance_contract_number": "contract number or null",
+      "insurance_group_number": "group number or null",
+      "subscriber_name": "subscriber name or null",
+      "subscriber_dob": "MM/DD/YYYY or null",
+      "subscriber_gender": "gender or null",
+      "subscriber_relationship": "relationship or null",
+      "insurance_address": "address or null",
+      "adjustor_fax": "fax or null",
+      "adjustor_phone": "phone or null",
+      "adjustor_name": "name or null",
+      "prior_auth_number": "auth number or null",
+      "card_insurance_group": "group from card or null",
+      "card_insurance_code": "code from card or null",
+      "card_id_insurance_name": "ID name from card or null",
+      "card_insured_member_id": "member ID from card or null",
+      "card_insurance_address": "address from card or null",
+      "card_insured_name": "insured name from card or null"
+    },
+    "tertiary": {
+      "present": "true or false",
+      "insurance_coverage": "coverage type or null",
+      "insurance_type": "type or null",
+      "insurance_name": "payer name or null",
+      "insurance_contract_number": "contract number or null",
+      "insurance_group_number": "group number or null",
+      "subscriber_name": "subscriber name or null",
+      "subscriber_dob": "MM/DD/YYYY or null",
+      "subscriber_gender": "gender or null",
+      "subscriber_relationship": "relationship or null",
+      "insurance_address": "address or null",
+      "adjustor_fax": "fax or null",
+      "adjustor_phone": "phone or null",
+      "adjustor_name": "name or null",
+      "prior_auth_number": "auth number or null",
+      "card_insurance_group": "group from card or null",
+      "card_insurance_code": "code from card or null",
+      "card_id_insurance_name": "ID name from card or null",
+      "card_insured_member_id": "member ID from card or null",
+      "card_insurance_address": "address from card or null",
+      "card_insured_name": "insured name from card or null"
+    }
+  },
+
+  "section5_employer": {
+    "present": "true or false",
+    "employer_name": "employer name or null",
+    "employer_status": "employment status or null"
+  }
+}`,
+
   unknown: `You are a healthcare document specialist. This document could not be auto-classified.
 Extract whatever structured information you can find. Respond ONLY with a JSON object — no markdown.
 
@@ -560,10 +720,20 @@ export async function detectDocumentType(
 
   const parsed = parseJson(text);
 
+  const detectionTokens: TokenUsage = {
+    input_tokens: response.usage.input_tokens,
+    output_tokens: response.usage.output_tokens,
+    total_tokens: response.usage.input_tokens + response.usage.output_tokens,
+    estimated_cost_usd:
+      (response.usage.input_tokens / 1_000_000) * 3.0 +
+      (response.usage.output_tokens / 1_000_000) * 15.0,
+  };
+
   return {
     doc_type: (parsed.doc_type as DocType) ?? 'unknown',
     confidence: (parsed.confidence as number) ?? 0.5,
     reason: (parsed.reason as string) ?? '',
+    token_usage: detectionTokens,
   };
 }
 
@@ -575,7 +745,7 @@ export async function extractFields(
   buffer: Buffer,
   mimeType: string,
   docType: DocType
-): Promise<Record<string, string | string[] | number | null>> {
+): Promise<{ fields: Record<string, string | string[] | number | null>; token_usage: TokenUsage }> {
   const prompt = EXTRACTION_PROMPTS[docType] ?? EXTRACTION_PROMPTS['unknown'];
   const content = buildContent(buffer, mimeType, prompt);
 
@@ -591,7 +761,15 @@ export async function extractFields(
     .join('');
 
   const parsed = parseJson(text);
-  return parsed as Record<string, string | string[] | number | null>;
+  const extractionTokens: TokenUsage = {
+    input_tokens: response.usage.input_tokens,
+    output_tokens: response.usage.output_tokens,
+    total_tokens: response.usage.input_tokens + response.usage.output_tokens,
+    estimated_cost_usd:
+      (response.usage.input_tokens / 1_000_000) * 3.0 +
+      (response.usage.output_tokens / 1_000_000) * 15.0,
+  };
+  return { fields: parsed as Record<string, string | string[] | number | null>, token_usage: extractionTokens };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -607,7 +785,16 @@ export async function runClaudePipeline(
   const detection = await detectDocumentType(buffer, mimeType);
 
   // Step 2: Extract
-  const fields = await extractFields(buffer, mimeType, detection.doc_type);
+  // Step 2: Extract
+  const { fields, token_usage: extractionTokens } = await extractFields(buffer, mimeType, detection.doc_type);
+
+  // Combined token usage across both calls
+  const token_usage: TokenUsage = {
+    input_tokens:       detection.token_usage.input_tokens + extractionTokens.input_tokens,
+    output_tokens:      detection.token_usage.output_tokens + extractionTokens.output_tokens,
+    total_tokens:       detection.token_usage.total_tokens + extractionTokens.total_tokens,
+    estimated_cost_usd: detection.token_usage.estimated_cost_usd + extractionTokens.estimated_cost_usd,
+  };
 
   // Raw text reconstruction from fields for display
   const raw_text = Object.entries(fields)
@@ -619,5 +806,6 @@ export async function runClaudePipeline(
     detection_confidence: detection.confidence,
     fields,
     raw_text,
+    token_usage,
   };
 }

@@ -80,6 +80,7 @@ export async function POST(req: NextRequest) {
         failed_count:          validation.failed_count,
         warning_count:         validation.warning_count,
         processing_time_ms:    processingTime,
+        token_usage:           extraction.token_usage,
       },
       fields:   validation.fields,
       flags:    validation.flags,

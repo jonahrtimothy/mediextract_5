@@ -7,12 +7,20 @@ import PipelineSteps, { buildSteps, PipelineData } from '@/components/PipelineSt
 import FieldCard from '@/components/FieldCard';
 import { ValidatedField } from '@/lib/validator';
 
+interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  estimated_cost_usd: number;
+}
+
 interface PipelineResult {
   pipeline: PipelineData & {
     file_name: string;
     file_size_kb: number;
     processing_time_ms: number;
     quality_issues: string[];
+    token_usage?: TokenUsage;
   };
   fields: Record<string, ValidatedField>;
   flags: string[];
@@ -30,7 +38,6 @@ export default function DemoPage() {
   const [showRaw, setShowRaw] = useState(false);
   const [activeTab, setActiveTab] = useState<'ocr' | 'architecture'>('ocr');
 
-  // Auth guard
   useEffect(() => {
     if (typeof window !== 'undefined') {
       const auth = sessionStorage.getItem('mediextract_auth');
@@ -72,10 +79,7 @@ export default function DemoPage() {
     state === 'done' ? 'done' : state === 'error' ? 'error' : 'processing'
   );
 
-  const fieldEntries = result
-    ? Object.entries(result.fields)
-    : [];
-
+  const fieldEntries = result ? Object.entries(result.fields) : [];
   const highFields   = fieldEntries.filter(([, f]) => f.confidence === 'high' && f.valid);
   const mediumFields = fieldEntries.filter(([, f]) => f.confidence === 'medium');
   const lowFields    = fieldEntries.filter(([, f]) => f.confidence === 'low' || !f.valid);
@@ -149,12 +153,18 @@ export default function DemoPage() {
                 <h2 className="text-white font-semibold text-sm mb-4">Pipeline Execution</h2>
                 <PipelineSteps steps={steps} />
 
-                {/* Timing */}
+                {/* Timing + token footer */}
                 {result && (
                   <div className="mt-4 pt-4 border-t border-gray-800 flex flex-wrap gap-4 text-xs text-gray-500">
                     <span>⏱ {result.pipeline.processing_time_ms}ms</span>
                     <span>📄 {result.pipeline.file_name}</span>
                     <span>💾 {result.pipeline.file_size_kb} KB</span>
+                    {result.pipeline.token_usage && (
+                      <>
+                        <span>🔤 {result.pipeline.token_usage.total_tokens.toLocaleString()} tokens</span>
+                        <span>💵 ~${result.pipeline.token_usage.estimated_cost_usd.toFixed(4)}</span>
+                      </>
+                    )}
                   </div>
                 )}
               </div>
@@ -224,7 +234,7 @@ export default function DemoPage() {
                   </div>
                 )}
 
-                {/* Fields — high confidence */}
+                {/* High confidence fields */}
                 {highFields.length > 0 && (
                   <div className="flex flex-col gap-2">
                     <h3 className="text-gray-400 text-xs uppercase tracking-wide font-medium">Validated Fields</h3>
@@ -236,7 +246,7 @@ export default function DemoPage() {
                   </div>
                 )}
 
-                {/* Fields — medium confidence */}
+                {/* Medium confidence fields */}
                 {mediumFields.length > 0 && (
                   <div className="flex flex-col gap-2">
                     <h3 className="text-gray-400 text-xs uppercase tracking-wide font-medium">Review Required</h3>
@@ -248,7 +258,7 @@ export default function DemoPage() {
                   </div>
                 )}
 
-                {/* Fields — low confidence / failed */}
+                {/* Low confidence / failed fields */}
                 {lowFields.length > 0 && (
                   <div className="flex flex-col gap-2">
                     <h3 className="text-gray-400 text-xs uppercase tracking-wide font-medium">Failed Validation</h3>
@@ -292,20 +302,20 @@ export default function DemoPage() {
           </p>
 
           {[
-            { layer: 'Layer 1', title: 'Document Format Detector', color: 'blue',
+            { layer: 'Layer 1', title: 'Document Format Detector',
               desc: 'Classifies the document as digital, scanned, handwritten, photographed, or mixed using pixel statistics and metadata analysis.' },
-            { layer: 'Layer 2', title: 'Quality Assessor', color: 'purple',
+            { layer: 'Layer 2', title: 'Quality Assessor',
               desc: 'Measures DPI, noise, contrast, blur, and skew. Outputs a quality score 0.0–1.0 and a list of recommended preprocessing steps.' },
-            { layer: 'Layer 3', title: 'Adaptive Preprocessor', color: 'indigo',
+            { layer: 'Layer 3', title: 'Adaptive Preprocessor',
               desc: 'Applies only what the quality score demands: deskew, denoise, CLAHE, upscale, binarize, sharpen. Uses sharp for Vercel-compatible image processing.' },
-            { layer: 'Layer 4', title: 'Claude Vision Extractor', color: 'cyan',
-              desc: 'Two-step process: quick detection call identifies document type, then one of 13 specialist RCM prompts extracts every field as structured JSON.' },
-            { layer: 'Layer 5', title: 'Field Validator + Confidence Scorer', color: 'green',
+            { layer: 'Layer 4', title: 'Claude Vision Extractor',
+              desc: 'Two-step process: quick detection call identifies document type, then one of 14 specialist RCM prompts extracts every field as structured JSON.' },
+            { layer: 'Layer 5', title: 'Field Validator + Confidence Scorer',
               desc: 'Validates NPI, ICD-10, CPT, HCPCS, dates, amounts, auth numbers, CARC/RARC codes. Cross-validates dates. Flags billing errors. Scores every field GREEN / AMBER / RED.' },
-          ].map(({ layer, title, color, desc }) => (
-            <div key={layer} className={`bg-gray-900 border border-${color}-900 rounded-2xl p-6 flex gap-4`}>
-              <div className={`shrink-0 w-20 h-20 rounded-xl bg-${color}-950 border border-${color}-800 flex flex-col items-center justify-center text-center`}>
-                <span className={`text-${color}-400 text-xs font-bold`}>{layer}</span>
+          ].map(({ layer, title, desc }) => (
+            <div key={layer} className="bg-gray-900 border border-gray-800 rounded-2xl p-6 flex gap-4">
+              <div className="shrink-0 w-20 h-20 rounded-xl bg-blue-950 border border-blue-800 flex flex-col items-center justify-center text-center">
+                <span className="text-blue-400 text-xs font-bold">{layer}</span>
               </div>
               <div>
                 <h3 className="text-white font-semibold mb-1">{title}</h3>
@@ -321,7 +331,7 @@ export default function DemoPage() {
                 ['Layout dependent', 'Semantic understanding'],
                 ['Breaks on form redesign', 'Zero-shot — works on any layout'],
                 ['100s of labeled samples', 'No training data needed'],
-                ['One model per form type', '13 universal RCM prompts'],
+                ['One model per form type', '14 universal RCM prompts'],
                 ['No medical knowledge', 'Deep clinical domain context'],
                 ['Enterprise licensing cost', 'Near-zero API cost at scale'],
               ].map(([bad, good], i) => (
@@ -334,6 +344,7 @@ export default function DemoPage() {
           </div>
         </div>
       )}
+
     </main>
   );
 }
