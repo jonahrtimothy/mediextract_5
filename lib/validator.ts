@@ -296,6 +296,96 @@ function routeField(key: string, value: string | string[] | number | null | unde
 // ─────────────────────────────────────────────────────────────
 // DATE CROSS-VALIDATION
 // ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// MINOR + GUARANTOR CROSS-VALIDATION
+// If patient is under 18, guarantor is required
+// ─────────────────────────────────────────────────────────────
+
+function validateMinorGuarantor(fields: Record<string, ValidatedField>): string[] {
+  const flags: string[] = [];
+
+  // Check is_minor flag from anesthesia demographics extraction
+  const isMinorField = fields['section1_patient.is_minor'] ||
+                       fields['is_minor'];
+
+  // Check patient age field
+  const ageField = fields['section1_patient.age'] ||
+                   fields['patient_age'] ||
+                   fields['age'];
+
+  // Check patient DOB to calculate age ourselves
+  const dobField = fields['section1_patient.date_of_birth'] ||
+                   fields['patient_dob'] ||
+                   fields['date_of_birth'];
+
+  let isMinor = false;
+
+  // Method 1 — explicit is_minor flag from Claude
+  if (String(isMinorField?.value).toLowerCase() === 'true') {
+    isMinor = true;
+  }
+
+  // Method 2 — age field directly
+  if (!isMinor && ageField?.value) {
+    const age = parseInt(String(ageField.value));
+    if (!isNaN(age) && age < 18) isMinor = true;
+  }
+
+  // Method 3 — calculate from DOB
+  if (!isMinor && dobField?.value) {
+    const dob = parseDate(String(dobField.value));
+    if (dob) {
+      const today = new Date();
+      const age = today.getFullYear() - dob.getFullYear() -
+        (today < new Date(today.getFullYear(), dob.getMonth(), dob.getDate()) ? 1 : 0);
+      if (age < 18) isMinor = true;
+    }
+  }
+
+  if (!isMinor) return flags;
+
+  // Patient is a minor — check guarantor is present
+  const guarantorPresent = fields['section3_guarantor.present'] ||
+                           fields['guarantor_present'];
+  const guarantorName    = fields['section3_guarantor.full_name'] ||
+                           fields['guarantor_name'] ||
+                           fields['guarantor_full_name'];
+
+  const hasGuarantor =
+    String(guarantorPresent?.value).toLowerCase() === 'true' ||
+    (guarantorName?.value !== null &&
+     guarantorName?.value !== undefined &&
+     String(guarantorName.value).trim() !== '' &&
+     String(guarantorName.value).toLowerCase() !== 'null');
+
+  if (!hasGuarantor) {
+    flags.push(
+      'MINOR PATIENT — Guarantor information is required but missing. ' +
+      'A parent or legal guardian must be designated as guarantor for patients under 18.'
+    );
+  } else {
+    // Guarantor present — validate relationship is appropriate
+    const relationship = fields['section3_guarantor.relationship'] ||
+                         fields['guarantor_relationship'];
+    if (relationship?.value) {
+      const rel = String(relationship.value).toLowerCase();
+      const validRelationships = [
+        'parent', 'mother', 'father', 'guardian', 'legal guardian',
+        'grandparent', 'grandmother', 'grandfather', 'foster parent',
+        'adoptive parent', 'stepparent', 'step-parent',
+      ];
+      const isValidRel = validRelationships.some(r => rel.includes(r));
+      if (!isValidRel) {
+        flags.push(
+          `MINOR PATIENT — Guarantor relationship "${relationship.value}" may not be valid. ` +
+          'Expected: parent, legal guardian, or grandparent.'
+        );
+      }
+    }
+  }
+
+  return flags;
+}
 
 function crossValidateDates(fields: Record<string, ValidatedField>): string[] {
   const flags: string[] = [];
@@ -381,9 +471,10 @@ export function validateFields(rawFields: RawFields): ValidationResult {
     fields[key] = routeField(key, value);
   }
 
-  const dateFlags    = crossValidateDates(fields);
-  const billingFlags = generateBillingFlags(fields);
-  const flags        = [...dateFlags, ...billingFlags];
+  const dateFlags      = crossValidateDates(fields);
+  const billingFlags   = generateBillingFlags(fields);
+  const minorFlags     = validateMinorGuarantor(fields);
+  const flags          = [...dateFlags, ...billingFlags, ...minorFlags];
 
   const validated_count = Object.values(fields).filter(f => f.valid).length;
   const failed_count    = Object.values(fields).filter(f => !f.valid).length;
