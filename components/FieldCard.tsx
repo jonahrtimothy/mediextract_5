@@ -14,9 +14,16 @@ function formatKey(key: string): string {
     .replace(/\b\w/g, c => c.toUpperCase());
 }
 
-function formatValue(value: ValidatedField['value']): string {
+function formatValue(value: unknown): string {
   if (value === null || value === undefined) return '—';
-  if (Array.isArray(value)) return value.length > 0 ? value.join(', ') : '—';
+  if (Array.isArray(value)) return value.length > 0 ? value.map(v => String(v)).join(', ') : '—';
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return '[complex value]';
+    }
+  }
   return String(value);
 }
 
@@ -30,7 +37,7 @@ export default function FieldCard({ fieldKey, field }: FieldCardProps) {
   };
 
   const scheme = colors[confidence];
-  const displayValue = formatValue(value);
+  const displayValue = formatValue(value as unknown);
 
   return (
     <div className={`rounded-xl border ${scheme.border} bg-gray-900 p-4 flex flex-col gap-2`}>
@@ -46,9 +53,15 @@ export default function FieldCard({ fieldKey, field }: FieldCardProps) {
       </div>
 
       {/* Value */}
-      <p className={`text-sm font-mono break-all ${valid ? 'text-white' : 'text-gray-400 line-through'}`}>
-        {displayValue}
-      </p>
+      {displayValue.includes('\n') ? (
+        <pre className={`text-xs font-mono break-all whitespace-pre-wrap max-h-32 overflow-y-auto ${valid ? 'text-white' : 'text-gray-400'}`}>
+          {displayValue}
+        </pre>
+      ) : (
+        <p className={`text-sm font-mono break-all ${valid ? 'text-white' : 'text-gray-400 line-through'}`}>
+          {displayValue}
+        </p>
+      )}
 
       {/* Reason (shown when invalid or medium confidence) */}
       {reason && (

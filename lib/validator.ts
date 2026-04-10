@@ -88,7 +88,11 @@ function isEmpty(value: string | string[] | number | null | undefined): boolean 
 function parseDate(raw: string): Date | null {
   const mdy = raw.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
   if (mdy) {
-    const year = mdy[3].length === 2 ? parseInt('20' + mdy[3]) : parseInt(mdy[3]);
+    let year = parseInt(mdy[3]);
+    if (mdy[3].length === 2) {
+      // 2-digit year: 00-29 → 2000-2029, 30-99 → 1930-1999
+      year = year <= 29 ? 2000 + year : 1900 + year;
+    }
     return new Date(year, parseInt(mdy[1]) - 1, parseInt(mdy[2]));
   }
   const ymd = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -164,7 +168,7 @@ function validateDate(raw: string, fieldName: string): ValidatedField {
   const now = new Date();
   const year = parsed.getFullYear();
   if (year < 1900 || year > now.getFullYear() + 1) {
-    return makeField(raw, 'medium', false, `${fieldName} year ${year} looks incorrect`);
+    return makeField(raw, 'medium', false, `${fieldName} year ${year} looks incorrect — verify date`);
   }
   return makeField(raw, 'high', true);
 }

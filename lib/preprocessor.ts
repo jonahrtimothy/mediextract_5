@@ -1,18 +1,28 @@
 // lib/preprocessor.ts
+// Layer 1 — Document Format Detector (7-type classification, no Claude)
 // Layer 2 — Quality Assessor
 // Layer 3 — Adaptive Preprocessor
-// Uses sharp (Node.js) for all image operations
 
 import sharp from 'sharp';
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+// const pdfParse = require('pdf-parse-new');
 
 // ─────────────────────────────────────────────────────────────
 // TYPES
 // ─────────────────────────────────────────────────────────────
 
-export type DocFormat = 'digital' | 'scanned' | 'handwritten' | 'photographed' | 'mixed';
+export type DocFormat =
+  | 'digital'
+  | 'scanned_digital'
+  | 'scanned_handwritten'
+  | 'scanned_mixed'
+  | 'photographed'
+  | 'faxed'
+  | 'unknown';
 
 export interface QualityReport {
-  quality_score: number;        // 0.0 – 1.0
+  quality_score: number;
   issues: string[];
   recommended_steps: PreprocessStep[];
   estimated_dpi: number;
@@ -42,68 +52,300 @@ export interface DocumentDetection {
   confidence: number;
   page_count: number;
   has_images: boolean;
+  format_detail: string; // human readable explanation
 }
 
 // ─────────────────────────────────────────────────────────────
-// LAYER 1 HELPER — Detect document format from buffer
-// Called before quality assessment
+// HELPERS — pixel analysis
 // ─────────────────────────────────────────────────────────────
 
-export async function detectDocumentFormat(buffer: Buffer, mimeType: string): Promise<DocumentDetection> {
-  // PDFs with text layer = digital
-  // Images need pixel analysis to classify
+interface PixelStats {
+  mean: number;
+  stdDev: number;
+  min: number;
+  max: number;
+  contrastRatio: number;
+  edgeDensity: number;
+}
 
-  if (mimeType === 'application/pdf') {
-    // PDFs sent directly to Claude — treat as digital
-    // Actual text extraction happens in Claude via pdf beta
-    return {
-      doc_format: 'digital',
-      confidence: 0.90,
-      page_count: 1,
-      has_images: false,
-    };
+async function getPixelStats(buffer: Buffer): Promise<PixelStats> {
+  const { data } = await sharp(buffer)
+    .grayscale()
+    .resize({ width: 800, withoutEnlargement: true })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const pixels = Array.from(data);
+  const len = pixels.length;
+
+  const mean = pixels.reduce((a, b) => a + b, 0) / len;
+  const variance = pixels.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / len;
+  const stdDev = Math.sqrt(variance);
+  const min = Math.min(...pixels);
+  const max = Math.max(...pixels);
+  const contrastRatio = (max - min) / 255;
+
+  let edgeSum = 0;
+  for (let i = 1; i < len; i++) {
+    edgeSum += Math.abs(pixels[i] - pixels[i - 1]);
+  }
+  const edgeDensity = edgeSum / len;
+
+  return { mean, stdDev, min, max, contrastRatio, edgeDensity };
+}
+
+// Inter-block variance — divides image into grid and measures
+// variance between block means. High = irregular = handwritten.
+// Low = uniform = printed/scanned digital.
+async function getInterBlockVariance(buffer: Buffer, gridSize = 4): Promise<number> {
+  const img = sharp(buffer).grayscale().resize({ width: 400, height: 400, fit: 'fill' });
+  const { data } = await img.raw().toBuffer({ resolveWithObject: true });
+  const pixels = Array.from(data);
+  const blockSize = Math.floor(400 / gridSize);
+  const blockMeans: number[] = [];
+
+  for (let row = 0; row < gridSize; row++) {
+    for (let col = 0; col < gridSize; col++) {
+      const blockPixels: number[] = [];
+      for (let r = row * blockSize; r < (row + 1) * blockSize; r++) {
+        for (let c = col * blockSize; c < (col + 1) * blockSize; c++) {
+          blockPixels.push(pixels[r * 400 + c] ?? 128);
+        }
+      }
+      const mean = blockPixels.reduce((a, b) => a + b, 0) / blockPixels.length;
+      blockMeans.push(mean);
+    }
   }
 
-  // For images, analyze pixel statistics to guess format
+  const overallMean = blockMeans.reduce((a, b) => a + b, 0) / blockMeans.length;
+  const interBlockVar = blockMeans.reduce((a, b) => a + Math.pow(b - overallMean, 2), 0) / blockMeans.length;
+  return interBlockVar;
+}
+
+// Lighting uniformity — checks if image has uneven illumination
+// (top-left vs bottom-right brightness difference > threshold = photographed)
+async function getLightingUniformity(buffer: Buffer): Promise<number> {
+  const size = 100;
+  const { data } = await sharp(buffer)
+    .grayscale()
+    .resize({ width: size * 2, height: size * 2, fit: 'fill' })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const pixels = Array.from(data);
+  const w = size * 2;
+
+  const getRegionMean = (rowStart: number, colStart: number): number => {
+    const region: number[] = [];
+    for (let r = rowStart; r < rowStart + size; r++) {
+      for (let c = colStart; c < colStart + size; c++) {
+        region.push(pixels[r * w + c] ?? 128);
+      }
+    }
+    return region.reduce((a, b) => a + b, 0) / region.length;
+  };
+
+  const topLeft     = getRegionMean(0, 0);
+  const topRight    = getRegionMean(0, size);
+  const bottomLeft  = getRegionMean(size, 0);
+  const bottomRight = getRegionMean(size, size);
+
+  const means = [topLeft, topRight, bottomLeft, bottomRight];
+  const avg = means.reduce((a, b) => a + b, 0) / 4;
+  const maxDiff = Math.max(...means) - Math.min(...means);
+
+  return maxDiff / (avg || 1); // normalized lighting difference ratio
+}
+
+// Fax artifact detection — horizontal line density check
+async function hasFaxArtifacts(buffer: Buffer): Promise<boolean> {
+  const { data, info } = await sharp(buffer)
+    .grayscale()
+    .resize({ width: 400 })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const pixels = Array.from(data);
+  const w = info.width;
+  const h = info.height;
+  let horizontalLineCount = 0;
+
+  // Check for rows that are nearly all dark (fax lines)
+  for (let r = 0; r < h; r++) {
+    const row = pixels.slice(r * w, (r + 1) * w);
+    const darkPixels = row.filter(p => p < 50).length;
+    if (darkPixels / w > 0.85) horizontalLineCount++;
+  }
+
+  return horizontalLineCount / h > 0.05; // more than 5% of rows are dark lines
+}
+
+// ─────────────────────────────────────────────────────────────
+// LAYER 1 — Document Format Detector
+// 7-type classification without Claude
+// ─────────────────────────────────────────────────────────────
+
+export async function detectDocumentFormat(
+  buffer: Buffer,
+  mimeType: string
+): Promise<DocumentDetection> {
+
+  // ── PDFs: check for text layer first ────────────────────
+  if (mimeType === 'application/pdf') {
+    try {
+      const pdfStr = buffer.toString('binary');
+
+      // Count pages via /Type /Page markers in PDF structure
+      const pageMatches = pdfStr.match(/\/Type\s*\/Page[^s]/g);
+      const pageCount = pageMatches ? pageMatches.length : 1;
+
+      // Detect text layer — PDFs with text contain BT (Begin Text) operators
+      // Detect embedded images
+      const hasImages = pdfStr.includes('/Image') || pdfStr.includes('/XObject');
+
+      // Extract readable ASCII text between BT...ET blocks
+      // Real text PDFs have Tj or TJ operators with actual string content
+      // Scanned PDFs may have BT/ET markers but no readable Tj/TJ content
+      const tjMatches = pdfStr.match(/\(([^\)]{3,})\)\s*Tj/g) || [];
+      const tjArrayMatches = pdfStr.match(/\[([^\]]{3,})\]\s*TJ/g) || [];
+      const totalTextOps = tjMatches.length + tjArrayMatches.length;
+
+      // Extract actual readable characters from Tj operators
+      const readableChars = tjMatches
+        .join(' ')
+        .replace(/[^\x20-\x7E]/g, '') // keep only printable ASCII
+        .length;
+
+      const charsPerPage = readableChars / pageCount;
+
+      if (charsPerPage > 50 && totalTextOps > 10) {
+        return {
+          doc_format: 'digital',
+          confidence: 0.93,
+          page_count: pageCount,
+          has_images: hasImages,
+          format_detail: `Born-digital PDF — ${readableChars} readable chars across ${pageCount} pages (${totalTextOps} text operations)`,
+        };
+      }
+
+      if (charsPerPage > 10 && totalTextOps > 3) {
+        return {
+          doc_format: 'scanned_mixed',
+          confidence: 0.75,
+          page_count: pageCount,
+          has_images: hasImages,
+          format_detail: `Mixed PDF — minimal readable text (${readableChars} chars), likely scanned with digital overlay`,
+        };
+      }
+
+      // No text layer at all — pure image PDF
+      // Could be scanned_handwritten, scanned_digital, or scanned_mixed
+      // We can't pixel-analyze PDF pages without rendering — default to scanned_mixed
+      // which is the most common healthcare document type
+      return {
+        doc_format: 'scanned_mixed',
+        confidence: 0.70,
+        page_count: pageCount,
+        has_images: true,
+        format_detail: `Image-only PDF (${pageCount} pages) — no text layer, scanned document`,
+      };
+
+    } catch {
+      return {
+        doc_format: 'unknown',
+        confidence: 0.40,
+        page_count: 1,
+        has_images: true,
+        format_detail: 'Could not parse PDF structure',
+      };
+    }
+  }
+
+  // ── Images: full pixel analysis ──────────────────────────
   try {
-    const { data, info } = await sharp(buffer)
-      .grayscale()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
+    const metadata = await sharp(buffer).metadata();
+    const isColor = (metadata.channels ?? 1) >= 3;
 
-    const pixels = Array.from(data);
-    const mean = pixels.reduce((a, b) => a + b, 0) / pixels.length;
-    const variance = pixels.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / pixels.length;
-    const stdDev = Math.sqrt(variance);
+    const stats = await getPixelStats(buffer);
+    const interBlockVar = await getInterBlockVariance(buffer);
+    const lightingDiff = await getLightingUniformity(buffer);
+    const faxArtifacts = await hasFaxArtifacts(buffer);
 
-    // Low stddev = mostly uniform = likely scanned printed page
-    // High stddev = lots of variation = likely photo or handwritten
-    let doc_format: DocFormat = 'scanned';
-    let confidence = 0.75;
-
-    if (stdDev < 30) {
-      doc_format = 'scanned';
-      confidence = 0.85;
-    } else if (stdDev > 80) {
-      doc_format = 'photographed';
-      confidence = 0.80;
-    } else {
-      doc_format = 'mixed';
-      confidence = 0.70;
+    // ── Fax detection ──────────────────────────────────────
+    if (faxArtifacts) {
+      return {
+        doc_format: 'faxed',
+        confidence: 0.85,
+        page_count: 1,
+        has_images: true,
+        format_detail: 'Fax artifacts detected — horizontal line density high, likely fax transmission',
+      };
     }
 
+    // ── Photographed detection ─────────────────────────────
+    // Uneven lighting across quadrants = camera photo
+    if (lightingDiff > 0.25) {
+      return {
+        doc_format: 'photographed',
+        confidence: 0.82,
+        page_count: 1,
+        has_images: true,
+        format_detail: `Photographed document — uneven lighting detected (${(lightingDiff * 100).toFixed(0)}% brightness variation across quadrants)`,
+      };
+    }
+
+    // ── Handwritten detection ──────────────────────────────
+    // High inter-block variance + high edge irregularity = handwritten
+    if (interBlockVar > 800 && stats.edgeDensity > 8) {
+      return {
+        doc_format: 'scanned_handwritten',
+        confidence: 0.80,
+        page_count: 1,
+        has_images: true,
+        format_detail: `Scanned handwritten document — irregular stroke patterns detected (block variance: ${interBlockVar.toFixed(0)})`,
+      };
+    }
+
+    // ── Mixed detection ────────────────────────────────────
+    // Medium inter-block variance = printed form + handwritten fill-ins
+    if (interBlockVar > 300 && interBlockVar <= 800) {
+      return {
+        doc_format: 'scanned_mixed',
+        confidence: 0.75,
+        page_count: 1,
+        has_images: true,
+        format_detail: `Scanned mixed document — printed form with handwritten annotations (block variance: ${interBlockVar.toFixed(0)})`,
+      };
+    }
+
+    // ── Scanned digital detection ──────────────────────────
+    // Low inter-block variance = uniform printed content = scanned digital
+    if (interBlockVar <= 300 && stats.stdDev > 20) {
+      return {
+        doc_format: 'scanned_digital',
+        confidence: 0.78,
+        page_count: 1,
+        has_images: true,
+        format_detail: `Scanned digital document — uniform printed content detected (block variance: ${interBlockVar.toFixed(0)})`,
+      };
+    }
+
+    // ── Digital image fallback ─────────────────────────────
     return {
-      doc_format,
-      confidence,
+      doc_format: 'digital',
+      confidence: 0.65,
       page_count: 1,
-      has_images: info.channels > 1,
+      has_images: isColor,
+      format_detail: `Digital image — clean pixel structure, likely screenshot or exported document`,
     };
+
   } catch {
     return {
-      doc_format: 'scanned',
-      confidence: 0.50,
+      doc_format: 'unknown',
+      confidence: 0.40,
       page_count: 1,
       has_images: false,
+      format_detail: 'Could not analyze image format',
     };
   }
 }
@@ -115,7 +357,6 @@ export async function detectDocumentFormat(buffer: Buffer, mimeType: string): Pr
 export async function assessQuality(buffer: Buffer): Promise<QualityReport> {
   const issues: string[] = [];
   const recommended_steps: PreprocessStep[] = [];
-
   let quality_score = 1.0;
   let estimated_dpi = 150;
   let is_color = false;
@@ -126,14 +367,10 @@ export async function assessQuality(buffer: Buffer): Promise<QualityReport> {
     const height = metadata.height ?? 0;
     is_color = (metadata.channels ?? 1) >= 3;
 
-    // ── DPI estimation ──────────────────────────────────────
-    // sharp exposes densityX/densityY if embedded in file
-    // Otherwise estimate from pixel dimensions
     const density = metadata.density ?? 0;
     if (density > 0) {
       estimated_dpi = density;
     } else if (width > 0 && height > 0) {
-      // Assume letter-size (8.5 x 11 inches) as baseline
       estimated_dpi = Math.round(Math.min(width / 8.5, height / 11));
     }
 
@@ -147,10 +384,9 @@ export async function assessQuality(buffer: Buffer): Promise<QualityReport> {
       quality_score -= 0.10;
     }
 
-    // ── Pixel statistics ────────────────────────────────────
     const { data, info } = await sharp(buffer)
       .grayscale()
-      .resize({ width: 800, withoutEnlargement: true }) // sample for speed
+      .resize({ width: 800, withoutEnlargement: true })
       .raw()
       .toBuffer({ resolveWithObject: true });
 
@@ -159,8 +395,6 @@ export async function assessQuality(buffer: Buffer): Promise<QualityReport> {
     const mean = pixels.reduce((a, b) => a + b, 0) / len;
     const variance = pixels.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / len;
     const stdDev = Math.sqrt(variance);
-
-    // ── Contrast check ──────────────────────────────────────
     const minPx = Math.min(...pixels);
     const maxPx = Math.max(...pixels);
     const contrastRatio = (maxPx - minPx) / 255;
@@ -176,15 +410,12 @@ export async function assessQuality(buffer: Buffer): Promise<QualityReport> {
       quality_score -= 0.08;
     }
 
-    // ── Noise check (high variance in near-uniform regions) ─
     if (stdDev > 60 && contrastRatio < 0.6) {
       issues.push('Noise detected — possibly fax artifact or poor scan');
       recommended_steps.push('denoise');
       quality_score -= 0.15;
     }
 
-    // ── Blur check (Laplacian variance proxy) ───────────────
-    // Simple edge density check using pixel differences
     let edgeSum = 0;
     for (let i = 1; i < len; i++) {
       edgeSum += Math.abs(pixels[i] - pixels[i - 1]);
@@ -197,20 +428,14 @@ export async function assessQuality(buffer: Buffer): Promise<QualityReport> {
       quality_score -= 0.15;
     }
 
-    // ── Size check ──────────────────────────────────────────
     if (width < 800 || height < 600) {
       issues.push(`Image resolution too small (${width}x${height}) — upscaling needed`);
       if (!recommended_steps.includes('upscale')) recommended_steps.push('upscale');
       quality_score -= 0.15;
     }
 
-    // ── Color → grayscale recommendation ────────────────────
-    if (is_color) {
-      recommended_steps.push('grayscale');
-    }
+    if (is_color) recommended_steps.push('grayscale');
 
-    // ── Skew heuristic ──────────────────────────────────────
-    // True skew detection needs OpenCV — here we flag based on aspect ratio anomalies
     const aspectRatio = width / height;
     if (aspectRatio > 1.6 || aspectRatio < 0.4) {
       issues.push('Unusual aspect ratio — document may be rotated or skewed');
@@ -218,32 +443,22 @@ export async function assessQuality(buffer: Buffer): Promise<QualityReport> {
       quality_score -= 0.10;
     }
 
-    void info; // suppress unused warning
+    void info;
 
-  } catch (err) {
+  } catch {
     issues.push('Could not analyze image quality — using defaults');
     quality_score = 0.60;
     recommended_steps.push('normalize');
   }
 
-  // Clamp score
   quality_score = Math.max(0, Math.round(quality_score * 100) / 100);
-
-  // Deduplicate steps
   const unique_steps = [...new Set(recommended_steps)] as PreprocessStep[];
 
-  return {
-    quality_score,
-    issues,
-    recommended_steps: unique_steps,
-    estimated_dpi,
-    is_color,
-  };
+  return { quality_score, issues, recommended_steps: unique_steps, estimated_dpi, is_color };
 }
 
 // ─────────────────────────────────────────────────────────────
 // LAYER 3 — Adaptive Preprocessor
-// Only applies steps that quality assessment recommends
 // ─────────────────────────────────────────────────────────────
 
 export async function preprocessImage(
@@ -252,51 +467,32 @@ export async function preprocessImage(
   targetMime: 'image/png' | 'image/jpeg' = 'image/png'
 ): Promise<PreprocessResult> {
   const steps_applied: PreprocessStep[] = [];
-
   let pipeline = sharp(buffer);
 
-  // ── Step: grayscale ─────────────────────────────────────
   if (steps.includes('grayscale')) {
     pipeline = pipeline.grayscale();
     steps_applied.push('grayscale');
   }
-
-  // ── Step: normalize (stretch histogram to full range) ───
   if (steps.includes('normalize')) {
     pipeline = pipeline.normalize();
     steps_applied.push('normalize');
   }
-
-  // ── Step: clahe (adaptive histogram equalization) ───────
-  // sharp doesn't have native CLAHE — we approximate with
-  // a combination of normalize + linear contrast adjustment
   if (steps.includes('clahe')) {
-    pipeline = pipeline
-      .normalise({ lower: 1, upper: 99 })
-      .linear(1.3, -20); // boost contrast
+    pipeline = pipeline.normalise({ lower: 1, upper: 99 }).linear(1.3, -20);
     steps_applied.push('clahe');
   }
-
-  // ── Step: denoise (mild median-like via blur + sharpen) ──
   if (steps.includes('denoise')) {
-    pipeline = pipeline
-      .median(3)        // 3x3 median filter — removes salt/pepper noise
-      .sharpen({ sigma: 0.5 }); // recover edge sharpness after median
+    pipeline = pipeline.median(3).sharpen({ sigma: 0.5 });
     steps_applied.push('denoise');
   }
-
-  // ── Step: sharpen ────────────────────────────────────────
   if (steps.includes('sharpen') && !steps_applied.includes('denoise')) {
     pipeline = pipeline.sharpen({ sigma: 1.0, m1: 1.5, m2: 0.7 });
     steps_applied.push('sharpen');
   }
-
-  // ── Step: upscale (to minimum 300 DPI equivalent) ───────
   if (steps.includes('upscale')) {
     const meta = await sharp(buffer).metadata();
     const w = meta.width ?? 800;
     if (w < 1700) {
-      // Scale up to ~2x or minimum 1700px wide (≈200 DPI on letter)
       const scaleFactor = Math.min(3.0, 1700 / w);
       pipeline = pipeline.resize({
         width: Math.round(w * scaleFactor),
@@ -305,31 +501,21 @@ export async function preprocessImage(
       steps_applied.push('upscale');
     }
   }
-
-  // ── Step: deskew ─────────────────────────────────────────
-  // True deskew needs OpenCV — sharp doesn't support it natively
-  // We rotate by 0 (no-op placeholder) and flag it was attempted
   if (steps.includes('deskew')) {
-    // In production: integrate opencv4nodejs or call Python microservice
-    // For now: sharp's rotate with background fill keeps image intact
     pipeline = pipeline.rotate(0, { background: { r: 255, g: 255, b: 255, alpha: 1 } });
     steps_applied.push('deskew');
   }
-
-  // ── Step: binarize (Otsu-like threshold) ─────────────────
   if (steps.includes('binarize')) {
     pipeline = pipeline.grayscale().threshold(128);
     if (!steps_applied.includes('grayscale')) steps_applied.push('grayscale');
     steps_applied.push('binarize');
   }
 
-  // ── Max width cap: 2000px for Claude Vision ──────────────
   const preFinalMeta = await pipeline.clone().metadata();
   if ((preFinalMeta.width ?? 0) > 2000) {
     pipeline = pipeline.resize({ width: 2000, withoutEnlargement: false });
   }
 
-  // ── Output format ─────────────────────────────────────────
   let outBuffer: Buffer;
   if (targetMime === 'image/jpeg') {
     outBuffer = await pipeline.jpeg({ quality: 92 }).toBuffer();
@@ -338,7 +524,6 @@ export async function preprocessImage(
   }
 
   const finalMeta = await sharp(outBuffer).metadata();
-
   return {
     buffer: outBuffer,
     mime_type: targetMime,
@@ -349,8 +534,7 @@ export async function preprocessImage(
 }
 
 // ─────────────────────────────────────────────────────────────
-// CONVENIENCE — Run full Layer 2 + 3 pipeline on an image buffer
-// Returns preprocessed buffer ready for Claude Vision
+// CONVENIENCE — Run full Layer 2 + 3 pipeline
 // ─────────────────────────────────────────────────────────────
 
 export async function runPreprocessPipeline(
@@ -358,7 +542,6 @@ export async function runPreprocessPipeline(
   mimeType: string
 ): Promise<{ result: PreprocessResult; report: QualityReport }> {
 
-  // PDFs skip image preprocessing — sent directly to Claude
   if (mimeType === 'application/pdf') {
     return {
       result: {
@@ -380,6 +563,5 @@ export async function runPreprocessPipeline(
 
   const report = await assessQuality(buffer);
   const result = await preprocessImage(buffer, report.recommended_steps);
-
   return { result, report };
 }
