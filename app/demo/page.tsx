@@ -91,7 +91,7 @@ export default function DemoPage() {
       <nav className="border-b border-gray-800 px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center text-sm font-bold">M</div>
-          <span className="font-semibold text-white">MediExtract</span>
+          <span className="font-semibold text-white">MediExtract_5</span>
           <span className="text-gray-600 text-sm">v1.0</span>
         </div>
         <div className="flex gap-1">
